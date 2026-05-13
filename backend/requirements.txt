@@ -1,0 +1,13 @@
+langchain
+langchain-community
+langchain-groq
+langchain-mcp-adapters
+chromadb
+sentence-transformers
+mcp
+python-dotenv
+requests
+fastapi
+uvicorn
+groq
+python-decouple
