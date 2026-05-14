@@ -84,7 +84,6 @@ Classify into exactly one of:
   Examples:
   "What is React?"
   "What is in a burger?"
-  "Who is Batman?"
   "What is the capital of France?"
 
 Reply with ONLY one word: REPO or GENERAL
