@@ -14,7 +14,7 @@ async def main():
             result = await tool.ainvoke(
                 {
                     "owner": "amritheshsiva",
-                    "repo": "hospital_management",
+                    "repo": "CineX",
                     "path": ""
                 }
             )
