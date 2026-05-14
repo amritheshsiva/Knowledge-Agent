@@ -1,12 +1,17 @@
-from langchain.agents import create_agent
 from langchain_core.messages import HumanMessage, SystemMessage
+from langchain.agents import create_agent
+import json
 
-from app.agent.mcp_servers import get_mcp_tools
+from app.agent.mcp_servers import get_mcp_tools, get_github_tools, get_notion_tools
 from app.agent.rag_chain import llm
-from app.agent.config import GITHUB_OWNER, GITHUB_REPO
-from app.agent.prompts import SYSTEM_PROMPT
+from app.agent.config import GITHUB_OWNER, GITHUB_REPO, NOTION_PAGE_ID
+from app.agent.prompts import SYSTEM_PROMPT, NOTION_SYSTEM_PROMPT
 from app.memory.rag_memory import save_memory, retrieve_memory
+from app.agent.synthesis import synthesize
+from app.agent.conflict import detect_conflict
 
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _has_raw_tool_call(text: str) -> bool:
     return "<function=" in text or "</function>" in text
@@ -25,6 +30,27 @@ def _build_memory_context(memories) -> str:
     return context
 
 
+def _is_project_question(question: str) -> bool:
+    """
+    Force REPO route for questions containing project-related keywords.
+    These questions must always hit live GitHub/Notion — never served from cache.
+    """
+    keywords = [
+        "cinex", "project hub", "timeline", "development timeline",
+        "when did i", "how long did", "started", "completed",
+        "challenges", "features", "tech stack", "what i learned",
+        "future improvements", "folder structure", "my project",
+        "what did i learn", "what are the features", "what is the status",
+        "who developed", "developer", "what i built", "i built",
+        "my app", "my repo", "repository", "codebase", "source code",
+        "components", "pages", "routes", "dependencies", "package",
+        "deployment", "vercel", "improvements", "what did you learn",
+        "app.js", "index.js", "code", "src",
+    ]
+    q = question.lower()
+    return any(k in q for k in keywords)
+
+
 async def _classify_question(question: str) -> str:
     response = await llm.ainvoke([
         SystemMessage(content="""
@@ -33,12 +59,26 @@ You are a router that classifies user questions.
 Classify into exactly one of:
 
 - REPO: user asks about a GitHub repository, codebase, project structure,
-  files, folders, tech stack, components, code, frameworks, dependencies.
+  files, folders, tech stack, components, code, frameworks, dependencies,
+  OR asks about a project's features, challenges, timeline, status, goals,
+  what they learned, or anything about a specific named project like CineX,
+  OR anything about "CineX Project Hub", development timeline, project history.
   Examples:
   "What does this project do?"
   "What files are in the src folder?"
   "What framework does this app use?"
   "What does App.js contain?"
+  "What challenges did I face?"
+  "What did I learn from building this?"
+  "What are the features of CineX?"
+  "What is the status of CineX?"
+  "Tell me everything about CineX"
+  "What is my development timeline?"
+  "Development timeline of CineX Project Hub"
+  "When did I start CineX?"
+  "How long did CineX take to build?"
+  "What are future improvements for CineX?"
+  "Who developed CineX?"
 
 - GENERAL: anything else — general knowledge, facts, definitions.
   Examples:
@@ -53,46 +93,104 @@ Reply with ONLY one word: REPO or GENERAL
     ])
 
     route = response.content.strip().upper()
-
     if route not in ("REPO", "GENERAL"):
         return "GENERAL"
-
     return route
 
 
 def _is_statement(question: str) -> bool:
     """
-    Detects if the input is a statement/fact
-    rather than a question.
+    Returns True only for genuine statements (facts the user is sharing),
+    NOT for short noun-phrase questions like "Features of CineX".
     """
     q = question.strip().lower()
 
-    # Questions usually start with these
+    # Short phrases (<=3 words) are almost always questions, not statements.
+    if len(q.split()) <= 3:
+        return False
+
     question_starters = (
         "what", "who", "where", "when", "why", "how",
         "is", "are", "do", "does", "did", "can", "could",
         "will", "would", "should", "which", "tell me",
-        "explain", "describe", "show me", "list"
+        "explain", "describe", "show me", "list", "give me",
+        "summarize", "features", "challenges", "timeline",
     )
 
-    # If it ends with ? it's a question
     if q.endswith("?"):
         return False
 
-    # If it starts with a question word it's a question
     if any(q.startswith(s) for s in question_starters):
         return False
 
     return True
 
 
+def _parse_notion_blocks(blocks_result) -> str:
+    """Parse Notion blocks result into clean readable text."""
+    try:
+        raw = blocks_result[0]["text"] if blocks_result else ""
+        data = json.loads(raw)
+        blocks = data.get("results", [])
+
+        page_content = ""
+        for block in blocks:
+            block_type = block.get("type", "")
+            type_data = block.get(block_type, {})
+            rich_text = type_data.get("rich_text", [])
+            text = "".join([t.get("plain_text", "") for t in rich_text])
+
+            if not text:
+                continue
+
+            if block_type == "heading_1":
+                page_content += f"\n# {text}\n"
+            elif block_type == "heading_2":
+                page_content += f"\n## {text}\n"
+            elif block_type == "heading_3":
+                page_content += f"\n### {text}\n"
+            elif block_type == "bulleted_list_item":
+                page_content += f"- {text}\n"
+            elif block_type == "numbered_list_item":
+                page_content += f"• {text}\n"
+            elif block_type == "paragraph":
+                page_content += f"{text}\n"
+            elif block_type == "code":
+                page_content += f"```\n{text}\n```\n"
+
+        return page_content
+
+    except Exception as e:
+        print(f"Error parsing notion blocks: {e}")
+        return ""
+
+
+def _extract_agent_answer(response: dict) -> str:
+    """
+    Safely extract the final text answer from create_agent response.
+    create_agent returns {"messages": [AIMessage, ToolMessage, AIMessage, ...]}
+    We want the last message with real text content (not a raw tool call).
+    """
+    messages = response.get("messages", [])
+
+    # Walk backwards — last real text message is the final answer
+    for msg in reversed(messages):
+        content = msg.content if hasattr(msg, "content") else str(msg)
+        if content and content.strip() and not _has_raw_tool_call(content):
+            return content
+
+    return ""
+
+
+# ── Main Agent ────────────────────────────────────────────────────────────────
+
 async def ask_agent(question: str):
 
-    print(f"\nQUESTION: {question}")
+    print(f"\n{'='*60}")
+    print(f"QUESTION: {question}")
+    print(f"{'='*60}")
 
-    # ── STEP 1: IF STATEMENT → SAVE AND RESPOND ───
-    # e.g. "My laptop is Asus Tuf F15"
-    # Save immediately and respond naturally
+    # ── STEP 1: IF STATEMENT → SAVE AND RESPOND ──────────────────────────────
     if _is_statement(question):
         print("DETECTED AS STATEMENT — SAVING TO MEMORY")
 
@@ -110,14 +208,20 @@ Acknowledge it briefly and naturally in one sentence.
         save_memory(question, final_answer)
         return final_answer
 
-    # ── STEP 2: SEARCH CHROMADB FOR SIMILAR ───────
+    # ── STEP 2: SEARCH CHROMADB FOR SIMILAR ──────────────────────────────────
     memories = retrieve_memory(question)
     memory_context = _build_memory_context(memories)
     has_relevant_memory = len(memories) > 0
     print(f"MEMORIES FOUND: {len(memories)}")
     print(f"MEMORY CONTEXT:\n{memory_context}")
 
-    # ── STEP 3: IF MEMORY FOUND → ANSWER FROM IT ──
+    # Project questions ALWAYS bypass memory and hit live sources.
+    # Prevents stale cached answers from being returned for codebase/Notion questions.
+    if has_relevant_memory and _is_project_question(question):
+        print("PROJECT QUESTION DETECTED — BYPASSING MEMORY, FORCING LIVE REPO ROUTE")
+        has_relevant_memory = False
+
+    # ── STEP 3: IF MEMORY FOUND → ANSWER FROM IT ─────────────────────────────
     if has_relevant_memory:
         print("CHECKING IF MEMORY IS ENOUGH TO ANSWER")
 
@@ -157,45 +261,126 @@ Current Question:
 
         print("MEMORY NOT ENOUGH — ROUTING FURTHER")
 
-    # ── STEP 4: CLASSIFY → REPO OR GENERAL ────────
-    route = await _classify_question(question)
-    print(f"ROUTE: {route}")
+    # ── STEP 4: CLASSIFY → REPO OR GENERAL ───────────────────────────────────
+    if _is_project_question(question):
+        route = "REPO"
+        print("ROUTE: REPO (keyword match)")
+    else:
+        route = await _classify_question(question)
+        print(f"ROUTE: {route} (LLM classifier)")
 
-    # ── REPO FLOW ─────────────────────────────────
+    # ── REPO FLOW ─────────────────────────────────────────────────────────────
     if route == "REPO":
-        print("USING REPO FLOW")
-        tools = await get_mcp_tools()
-        agent = create_agent(
-            model=llm,
-            tools=tools,
-            system_prompt=SYSTEM_PROMPT
-        )
+        print("\n--- REPO FLOW ---")
+
+        github_tools = await get_github_tools()
+        notion_tools = await get_notion_tools()
+
+        # ── Query GitHub via create_agent ─────────────────────────────────────
+        github_answer = ""
         try:
-            response = await agent.ainvoke({
+            github_agent = create_agent(
+                model=llm,
+                tools=github_tools,
+                system_prompt=SYSTEM_PROMPT,
+            )
+
+            github_response = await github_agent.ainvoke({
                 "messages": [{
                     "role": "user",
-                    "content": f"Owner: {GITHUB_OWNER}\nRepo: {GITHUB_REPO}\nQuestion: {question}"
+                    "content": (
+                        f"Owner: {GITHUB_OWNER}\n"
+                        f"Repo: {GITHUB_REPO}\n"
+                        f"Question: {question}"
+                    )
                 }]
             })
-            final_answer = response["messages"][-1].content
-            if _has_raw_tool_call(final_answer):
-                final_answer = (
-                    "The model returned a raw tool call. Please try again."
-                )
-        except Exception as e:
-            final_answer = f"Agent error: {e}"
 
-    # ── GENERAL FLOW ──────────────────────────────
+            github_answer = _extract_agent_answer(github_response)
+            print(f"\nGITHUB ANSWER (preview): {github_answer[:200]}...")
+
+        except Exception as e:
+            print(f"❌ GitHub error: {e}")
+            import traceback
+            traceback.print_exc()
+
+        # ── Query Notion (direct tool call — no agent needed) ─────────────────
+        notion_answer = ""
+        try:
+            notion_tools_map = {t.name: t for t in notion_tools}
+            print(f"NOTION TOOLS AVAILABLE: {list(notion_tools_map.keys())}")
+
+            blocks_tool = notion_tools_map.get("notion__API-get-block-children")
+
+            if not blocks_tool:
+                print(
+                    f"❌ CRITICAL: 'notion__API-get-block-children' not found.\n"
+                    f"   Available tools: {list(notion_tools_map.keys())}\n"
+                    f"   Update NOTION_TOOL_NAMES in mcp_servers.py to match exact names above."
+                )
+            else:
+                blocks_result = await blocks_tool.ainvoke({
+                    "block_id": NOTION_PAGE_ID
+                })
+
+                page_content = _parse_notion_blocks(blocks_result)
+                print(f"\nPARSED NOTION CONTENT (preview):\n{page_content[:500]}...")
+
+                if page_content:
+                    notion_response = await llm.ainvoke([
+                        SystemMessage(content="""
+You are a helpful assistant.
+Answer the question using ONLY the Notion page content provided.
+Do not use general knowledge.
+Look carefully through ALL sections — tech stack, overview, features,
+timeline, challenges, what I learned, future improvements, links.
+If the answer is genuinely not anywhere in the content, say "Not found in Notion page."
+"""),
+                        HumanMessage(content=f"""
+Notion page content:
+{page_content}
+
+Question: {question}
+""")
+                    ])
+                    notion_answer = notion_response.content
+                else:
+                    print("⚠️ NO PAGE CONTENT PARSED FROM NOTION — check block structure")
+
+            print(f"\nNOTION ANSWER (preview): {notion_answer[:200]}...")
+
+        except Exception as e:
+            print(f"❌ Notion error: {e}")
+            import traceback
+            traceback.print_exc()
+
+        # ── Conflict Detection ────────────────────────────────────────────────
+        sources = {
+            "github": github_answer,
+            "notion": notion_answer,
+        }
+
+        conflict = await detect_conflict(sources)
+        if conflict["has_conflict"]:
+            print(f"⚠️ CONFLICT DETECTED: {conflict['conflict_description']}")
+
+        # ── Synthesize Final Answer ───────────────────────────────────────────
+        final_answer = await synthesize(question, sources)
+
+    # ── GENERAL FLOW ──────────────────────────────────────────────────────────
     else:
-        print("USING GENERAL FLOW")
+        print("\n--- GENERAL FLOW ---")
         response = await llm.ainvoke([
             SystemMessage(content="You are a helpful AI assistant."),
             HumanMessage(content=question)
         ])
         final_answer = response.content
 
-    # ── STEP 5: SAVE FINAL ANSWER ─────────────────
+    # ── STEP 5: SAVE FINAL ANSWER ─────────────────────────────────────────────
     if final_answer and not _has_raw_tool_call(final_answer):
         save_memory(question, final_answer)
+    else:
+        print("⚠️ Final answer empty or contains raw tool call — NOT saving to memory")
 
+    print(f"\nFINAL ANSWER (preview): {final_answer[:200]}...")
     return final_answer
