@@ -108,8 +108,8 @@ GITHUB_TOOL_NAMES = {
 }
 
 NOTION_TOOL_NAMES = {
-    "API-retrieve-a-page",
     "API-get-block-children",
+    "API-retrieve-a-page",
     "API-post-search",
 }
 

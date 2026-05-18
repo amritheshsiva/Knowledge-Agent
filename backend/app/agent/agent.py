@@ -1,6 +1,6 @@
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain.agents import create_agent
-from app.agent.mcp_servers import get_mcp_tools, get_github_tools, get_notion_tools
+from app.agent.mcp_servers import get_github_tools, get_notion_tools
 from app.agent.rag_chain import llm
 from app.agent.config import GITHUB_OWNER, GITHUB_REPO, NOTION_PAGE_ID
 from app.agent.prompts import SYSTEM_PROMPT
