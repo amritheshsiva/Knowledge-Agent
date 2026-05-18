@@ -1,14 +1,13 @@
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain.agents import create_agent
-import json
-
 from app.agent.mcp_servers import get_mcp_tools, get_github_tools, get_notion_tools
 from app.agent.rag_chain import llm
 from app.agent.config import GITHUB_OWNER, GITHUB_REPO, NOTION_PAGE_ID
-from app.agent.prompts import SYSTEM_PROMPT, NOTION_SYSTEM_PROMPT
+from app.agent.prompts import SYSTEM_PROMPT
 from app.memory.rag_memory import save_memory, retrieve_memory
 from app.agent.synthesis import synthesize
 from app.agent.conflict import detect_conflict
+import json
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -16,7 +15,7 @@ from app.agent.conflict import detect_conflict
 def _has_raw_tool_call(text: str) -> bool:
     return "<function=" in text or "</function>" in text
 
-
+#   Converts retrieved memory into formatted(Que,Ans) context
 def _build_memory_context(memories) -> str:
     context = ""
     for memory in memories:
@@ -45,12 +44,16 @@ def _is_project_question(question: str) -> bool:
         "my app", "my repo", "repository", "codebase", "source code",
         "components", "pages", "routes", "dependencies", "package",
         "deployment", "vercel", "improvements", "what did you learn",
-        "app.js", "index.js", "code", "src",
+        "app.js", "index.js", "code", "src","repository","repo","folder",
+        "folder structure","project structure","architecture","frontend",
+        "backend","app.js","index.js","src","package.json","commit","commits",
+        "recent changes","latest changes","pull request","issue","github",
+        "codebase","react",
     ]
     q = question.lower()
     return any(k in q for k in keywords)
 
-
+# use llm to classify - REPO/GENERAL que
 async def _classify_question(question: str) -> str:
     response = await llm.ainvoke([
         SystemMessage(content="""
@@ -116,7 +119,7 @@ def _is_statement(question: str) -> bool:
         "summarize", "features", "challenges", "timeline",
     )
 
-    if q.endswith("?"):
+    if q.endswith("?"):   
         return False
 
     if any(q.startswith(s) for s in question_starters):
@@ -124,24 +127,25 @@ def _is_statement(question: str) -> bool:
 
     return True
 
-
+# raw Notion --> readable text
 def _parse_notion_blocks(blocks_result) -> str:
     """Parse Notion blocks result into clean readable text."""
     try:
-        raw = blocks_result[0]["text"] if blocks_result else ""
-        data = json.loads(raw)
-        blocks = data.get("results", [])
+        raw = blocks_result[0]["text"] if blocks_result else "" # gets raw json
+        data = json.loads(raw)  #json --> python dict
+        blocks = data.get("results", [])  # get all notion block
 
         page_content = ""
         for block in blocks:
-            block_type = block.get("type", "")
-            type_data = block.get(block_type, {})
+            block_type = block.get("type", "") # gets block type-heading,paragraph,buletin,etc
+            type_data = block.get(block_type, {}) 
             rich_text = type_data.get("rich_text", [])
             text = "".join([t.get("plain_text", "") for t in rich_text])
 
-            if not text:
+            if not text:   # skips empty blocks
                 continue
 
+# Formats different block types ,eg: #-h1,##-2,etc
             if block_type == "heading_1":
                 page_content += f"\n# {text}\n"
             elif block_type == "heading_2":
@@ -197,18 +201,18 @@ async def ask_agent(question: str):
 
         response = await llm.ainvoke([
             SystemMessage(content="""
-You are a helpful AI assistant.
-The user is sharing information about themselves.
-Acknowledge it briefly and naturally in one sentence.
-"""),
+                          You are a helpful AI assistant.
+                          The user is sharing information about themselves.
+                          Acknowledge it briefly and naturally in one sentence.
+                          """),
             HumanMessage(content=question)
         ])
         final_answer = response.content
         save_memory(question, final_answer)
         return final_answer
 
-    # ── STEP 2: SEARCH CHROMADB FOR SIMILAR ──────────────────────────────────
-    memories = retrieve_memory(question)
+    # ── STEP 2: SEARCH CHROMADB FOR SIMILAR Previous Conversations──────────────────
+    memories = retrieve_memory(question)   # from rag_memory.py
     memory_context = _build_memory_context(memories)
     has_relevant_memory = len(memories) > 0
     print(f"MEMORIES FOUND: {len(memories)}")
@@ -242,13 +246,12 @@ IMPORTANT:
 Do not explain. Just answer or say MEMORY_NOT_ENOUGH.
 """),
             HumanMessage(content=f"""
-Previous Memories:
-{memory_context}
-
-Current Question:
-{question}
+                         Previous Memories:
+                         {memory_context}
+                         Current Question:
+                         {question}
 """)
-        ])
+])
 
         memory_answer = check_response.content.strip()
         print(f"MEMORY ANSWER: {memory_answer}")
@@ -271,13 +274,31 @@ Current Question:
     # ── REPO FLOW ─────────────────────────────────────────────────────────────
     if route == "REPO":
         print("\n--- REPO FLOW ---")
-
+        # To Load Github and Notion Tools
         github_tools = await get_github_tools()
         notion_tools = await get_notion_tools()
+        # Force repository root inspection first
+        try:
+            #First calls get_file_contents tool,returns top-level folders/files
+            root_tool = next(   
+                t for t in github_tools
+                if "get_file_contents" in t.name
+                )
+            root_result = await root_tool.ainvoke({
+                "owner": GITHUB_OWNER,
+                "repo": GITHUB_REPO,
+                "path": ""
+                })
+            print("\nROOT REPOSITORY STRUCTURE:")
+            print(root_result)
+            
+        except Exception as e:
+            print(f"Failed to inspect repository root: {e}")
 
         # ── Query GitHub via create_agent ─────────────────────────────────────
         github_answer = ""
         try:
+            
             github_agent = create_agent(
                 model=llm,
                 tools=github_tools,
@@ -290,6 +311,7 @@ Current Question:
                     "content": (
                         f"Owner: {GITHUB_OWNER}\n"
                         f"Repo: {GITHUB_REPO}\n"
+                        f"Repository Root Structure:\n{root_result}\n\n"
                         f"Question: {question}"
                     )
                 }]
@@ -318,7 +340,8 @@ Current Question:
                     f"   Update NOTION_TOOL_NAMES in mcp_servers.py to match exact names above."
                 )
             else:
-                blocks_result = await blocks_tool.ainvoke({
+                #directly fetches notion page
+                blocks_result = await blocks_tool.ainvoke({  
                     "block_id": NOTION_PAGE_ID
                 })
 

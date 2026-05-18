@@ -1,13 +1,16 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
-
 from app.agent.agent import ask_agent
 
+# starting the API server
 app = FastAPI()
 
+# Requesting the modal structure
 class ChatRequest(BaseModel):
     question: str
-@app.get("/")
+
+# when someome visits,it returns a json resposne(confirms server running)
+@app.get("/")   
 def home():
     return {
         "message": "Backend running"
@@ -21,3 +24,4 @@ async def chat(request: ChatRequest):
         "question": request.question,
         "answer": answer
     }
+    
