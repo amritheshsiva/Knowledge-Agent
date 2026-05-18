@@ -9,7 +9,6 @@ app = FastAPI()
 class ChatRequest(BaseModel):
     question: str
 
-# when someome visits,it returns a json resposne(confirms server running)
 @app.get("/")   
 def home():
     return {
